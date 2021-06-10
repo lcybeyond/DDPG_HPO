@@ -12,16 +12,16 @@ from read_data import read_data
 class Actor(torch.nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(Actor, self).__init__()
-        self.linear1 = torch.nn.Linear(input_size, hidden_size)
-        self.linear2 = torch.nn.Linear(hidden_size, hidden_size)
-        self.linear3 = torch.nn.Linear(hidden_size, output_size)
+        self.encoder = torch.nn.Linear(input_size, hidden_size)
+        self.lstm = torch.nn.LSTM(hidden_size, hidden_size,1)
+        self.decoder = torch.nn.Linear(hidden_size, output_size)
 
     def forward(self, s):
-        x = torch.relu(self.linear1(s))
-        x = torch.relu(self.linear2(x))
-        x = torch.tanh(self.linear3(x))
-
-        return x
+        embed = self.encoder(s).unsqueeze(0)
+        output, (hn, cn) = self.lstm(embed)
+        logits = self.decoder(output)
+        logits = (2.5 * torch.sigmoid(logits))
+        return logits
 
 
 class Critic(torch.nn.Module):
@@ -29,13 +29,15 @@ class Critic(torch.nn.Module):
         super().__init__()
         self.linear1 = torch.nn.Linear(input_size, hidden_size)
         self.linear2 = torch.nn.Linear(hidden_size, hidden_size)
-        self.linear3 = torch.nn.Linear(hidden_size, output_size)
+        self.linear3 = torch.nn.Linear(hidden_size, hidden_size)
+        self.linear4 = torch.nn.Linear(hidden_size, output_size)
 
     def forward(self, s, a):
         x = torch.cat([s, a], 1)
         x = torch.relu(self.linear1(x))
         x = torch.relu(self.linear2(x))
-        x = self.linear3(x)
+        x = torch.relu(self.linear3(x))
+        x = self.linear4(x)
 
         return x
 
@@ -59,8 +61,10 @@ class env(torch.nn.Module):
         self.y_train = read_data()[2]
         self.y_test = read_data()[3]
 
+        self.baseline=None
+
     def reset_parameters(self):
-        init_range = 0.1
+        init_range = 1
         for param in self.parameters():
             param.data.uniform_(-init_range, init_range)
         self.decoder.bias.data.fill_(0)
@@ -81,7 +85,14 @@ class env(torch.nn.Module):
         xgb = construct_xgb(action)
         xgb.fit(self.X_train.astype('float') / 256, self.y_train)
         pred = xgb.predict(self.X_test)
-        Reward = -mean_squared_error(self.y_test, pred)
+        Reward = 10-mean_squared_error(self.y_test, pred)
+
+        if self.baseline is None:
+            self.baseline = Reward
+        else:
+            self.baseline = 0.95 * self.baseline + (1 - 0.95) * Reward
+
+        Reward=Reward-self.baseline
 
         inputs = self.static_inputs[1]
         logits, hidden = self.forward(inputs, self.hidden)
@@ -100,9 +111,9 @@ class Skylark_DDPG():
     def __init__(self, env):
         self.env = env
         self.gamma = 0.99
-        self.actor_lr = 0.001
-        self.critic_lr = 0.001
-        self.tau = 0.02
+        self.actor_lr = 0.01
+        self.critic_lr = 0.01
+        self.tau = 0.2
         self.capacity = 10000
         self.batch_size = 32
 
@@ -117,6 +128,7 @@ class Skylark_DDPG():
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr = self.critic_lr)
         self.buffer = []
         self.REWARD=[]
+        self.update_i=0
 
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -160,12 +172,12 @@ class Skylark_DDPG():
         s0, a0, r1, s1 = zip(*samples)
 
         s0 = torch.tensor(s0, dtype=torch.float).squeeze(1)
-        a0 = torch.tensor(a0, dtype=torch.float)
-        r1 = torch.tensor(r1, dtype=torch.float).view(self.batch_size,-1)
+        a0 = torch.tensor(a0, dtype=torch.float).squeeze(1)
+        r1 = torch.tensor(r1, dtype=torch.float).view( self.batch_size,-1)
         s1 = torch.tensor(s1, dtype=torch.float).squeeze(1)
 
         def critic_learn():
-            a1 = self.actor_target(s1).detach()
+            a1 = self.actor_target(s1).squeeze().detach()
             y_true = r1 + self.gamma * self.critic_target(s1, a1).detach()
 
             y_pred = self.critic(s0, a0)
@@ -177,16 +189,32 @@ class Skylark_DDPG():
             self.critic_optim.step()
 
         def actor_learn():
+            # action=self.actor(s0)
+            # min_reward=100
+            # i= random.randint(0, 31)
+            # for i in range(32):
+            #     xgb = construct_xgb(action.detach().numpy()[:,i,:])
+            #     xgb.fit(self.X_train.astype('float') / 256, self.y_train)
+            #     pred = xgb.predict(self.X_test)
+            #     reward = mean_squared_error(self.y_test, pred)
+            #     if reward<min_reward:
+            #         min_reward=reward
+            # self.REWARD.append(min_reward)
+            # print(min_reward)
+
+
+
             action=self.actor(s0)
-            xgb = construct_xgb(action.detach().numpy()[0])
+            i= random.randint(0, 31)
+            xgb = construct_xgb(action.detach().numpy()[:,i,:])
             xgb.fit(self.X_train.astype('float') / 256, self.y_train)
             pred = xgb.predict(self.X_test)
             reward = mean_squared_error(self.y_test, pred)
-            print(reward)
             self.REWARD.append(reward)
+            print(reward)
 
 
-            loss = -torch.mean( self.critic(s0, self.actor(s0)) )
+            loss = -torch.mean( self.critic(s0, self.actor(s0).squeeze()) )
             self.actor_optim.zero_grad()
             loss.backward()
             self.actor_optim.step()
@@ -197,15 +225,18 @@ class Skylark_DDPG():
 
         critic_learn()
         actor_learn()
-        soft_update(self.critic_target, self.critic, self.tau)
-        soft_update(self.actor_target, self.actor, self.tau)
+        self.update_i=self.update_i+1
+        if self.update_i%4==0:
+            soft_update(self.critic_target, self.critic, self.tau)
+            soft_update(self.actor_target, self.actor, self.tau)
+            self.update_i=0
 
     def train(self, num_episodes):
         for i in range(1, num_episodes):
             s0 = self.env.reset()
             episode_reward = 0
 
-            for t in range(1, 1000):
+            for t in range(1, 100):
                 # self.env.render()
                 a0 = self.act(s0)
                 s1, r1, done = self.env.step(a0)
@@ -218,15 +249,11 @@ class Skylark_DDPG():
 
             print('Episode {} : {}'.format(i, episode_reward))
         print(len(self.REWARD))
-        plt.plot(range(968), self.REWARD)
+        plt.plot(range(959), self.REWARD)
         plt.show()
         np.savetxt("./result.txt", self.REWARD)
 
 
-
-
-
-
 environment=env()
 DDPG=Skylark_DDPG(environment)
-DDPG.train(2)
+DDPG.train(11)

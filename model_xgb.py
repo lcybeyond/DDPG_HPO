@@ -15,7 +15,7 @@ def construct_xgb(param):
                   [0.5, 1],
                   [0.1, 0.9],
                   [0.01, 0.1]]
-    para_list = param
+    para_list = param[0]
     # print(para_list[0])
 
     para_ = []
